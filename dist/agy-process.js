@@ -55,7 +55,7 @@ function writeFilteredMcp(realFile, mirrorFile, allow) {
     writeFileSync(mirrorFile, JSON.stringify({ mcpServers: kept }, null, 2));
 }
 
-function mirrorHome(mcpServers) {
+export function mirrorHome(mcpServers) {
     if (mcpServers === "all")
         return undefined;
     const allow = Array.isArray(mcpServers) ? mcpServers : [];
@@ -115,7 +115,9 @@ class AgyProcess {
         this.exited = false;
         this.stderr = "";
         this.idleTimer = undefined;
-        const args = ["--add-dir", config.cwd, "--dangerously-skip-permissions", ...(config.extraArgs ?? [])];
+        // PATCH(agy-delegate): skipPermissions defaults on for the provider; the
+        // delegate tool turns it on only when the caller passes yolo.
+        const args = ["--add-dir", config.cwd, ...(config.skipPermissions === false ? [] : ["--dangerously-skip-permissions"]), ...(config.extraArgs ?? [])];
         if (config.model)
             args.push("--model", config.model);
         if (config.effort?.trim())
@@ -130,6 +132,7 @@ class AgyProcess {
         catch {
             home = undefined; // fall back to the real HOME (slower, but works)
         }
+        this.spawnedAt = Date.now();
         this.child = spawn(config.binary ?? "agy", args, {
             cwd: config.cwd,
             stdio: ["pipe", "pipe", "pipe"],
@@ -170,6 +173,8 @@ class AgyProcess {
             return Promise.reject(abortError(abortSignal.reason));
         clearTimeout(this.idleTimer);
         this.child.ref?.();
+        const turnStart = Date.now();
+        trace(`turn start pid=${this.child.pid} spawnedAgo=${turnStart - this.spawnedAt}ms`);
         return new Promise((resolve, reject) => {
             const turn = {
                 onEvent,
@@ -177,6 +182,7 @@ class AgyProcess {
                 usage: undefined,
                 streamError: undefined,
                 resolve: (value) => {
+                    trace(`turn done in ${Date.now() - turnStart}ms (init after spawn: ${this.initAt ? this.initAt - this.spawnedAt : "n/a"}ms)`);
                     finish();
                     resolve(value);
                 },
@@ -247,6 +253,7 @@ class AgyProcess {
         turn?.touch?.();
         const emit = (event) => turn?.onEvent(event);
         if (parsed.event === "init") {
+            this.initAt ??= Date.now();
             const id = str(parsed.conversation_id);
             if (id) {
                 this.conversationId = id;
@@ -345,7 +352,7 @@ class AgyProcess {
             return;
         // Let the host exit while this process sits idle between turns.
         this.child.unref?.();
-        this.idleTimer = setTimeout(() => this.dispose(), IDLE_MS);
+        this.idleTimer = setTimeout(() => this.dispose(), this.config.idleMs ?? IDLE_MS);
         this.idleTimer.unref?.();
     }
 
@@ -392,7 +399,29 @@ class AgyProcess {
 }
 
 function signature(config) {
-    return JSON.stringify([config.binary ?? "agy", config.cwd, config.model ?? "", config.effort ?? "", config.extraArgs ?? [], config.mcpServers ?? []]);
+    return JSON.stringify([config.binary ?? "agy", config.cwd, config.model ?? "", config.effort ?? "", config.extraArgs ?? [], config.mcpServers ?? [], config.skipPermissions !== false]);
+}
+
+// PATCH(agy-prewarm): start a session's agy process before its first turn.
+// agy does its startup (keyring auth, loadCodeAssist, model list) right away,
+// so the first turn only pays for the model call. Unused prewarms exit after
+// PREWARM_TTL_MS. AGY_PREWARM=off disables it.
+const BUSY_WAIT_MS = Number(process.env.AGY_BUSY_WAIT_MS ?? 5 * 60_000);
+const PREWARM_TTL_MS =Number(process.env.AGY_PREWARM_TTL_MS ?? 5 * 60_000);
+export function prewarmAgyProcess(sessionKey, config) {
+    if (process.env.AGY_PREWARM === "off" || pool.has(sessionKey))
+        return false;
+    const proc = new AgyProcess(config);
+    pool.set(sessionKey, proc);
+    trace(`prewarm key=${sessionKey}`);
+    proc.child.unref?.();
+    proc.idleTimer = setTimeout(() => proc.dispose(), PREWARM_TTL_MS);
+    proc.idleTimer.unref?.();
+    return true;
+}
+
+export function disposeAgyProcess(sessionKey) {
+    pool.get(sessionKey)?.dispose();
 }
 
 /**
@@ -412,9 +441,23 @@ export async function runAgyPersistent(sessionKey, config, prompt, onEvent, opti
     }
     let oneOff = false;
     if (proc?.busy) {
-        // Concurrent call on the same session: don't interleave turns on one stdin.
-        proc = new AgyProcess(config);
-        oneOff = true;
+        // PATCH(agy-broker): a turn is still running for this chat, typically one
+        // started before a view switch. Wait for it (up to BUSY_WAIT_MS) so the
+        // new message lands in the same continuous conversation.
+        onEvent({ type: "status", text: "Waiting for previous agy turn" });
+        const until = Date.now() + BUSY_WAIT_MS;
+        while (proc.busy && !proc.exited && Date.now() < until && !options?.abortSignal?.aborted)
+            await new Promise((r) => setTimeout(r, 250));
+        if (!proc.exited && !proc.busy)
+            return runAgyPersistent(sessionKey, config, prompt, onEvent, options);
+        if (proc.busy && !proc.exited) {
+            // Still busy: don't interleave turns on one stdin.
+            proc = new AgyProcess(config);
+            oneOff = true;
+        }
+        else {
+            return runAgyPersistent(sessionKey, config, prompt, onEvent, options);
+        }
     }
     if (!proc) {
         onEvent({ type: "status", text: config.conversationId ? "Resuming agy conversation" : "Starting agy" });
@@ -432,10 +475,37 @@ export async function runAgyPersistent(sessionKey, config, prompt, onEvent, opti
     try {
         return await proc.run(prompt, onEvent, options);
     }
+    catch (err) {
+        if (!oneOff && err?.name === "AbortError")
+            respawnAfterAbort(sessionKey, proc);
+        throw err;
+    }
     finally {
         if (oneOff)
             proc.dispose();
     }
+}
+
+// PATCH(agy-abort-respawn): agy's stream-json input has no cancel event and
+// SIGINT exits the process, so Stop must kill agy. Start its replacement on the
+// same --conversation right away, while the user types the next message, so
+// that message lands on a warm process instead of "Resuming agy conversation".
+// Triggered only by the user's Stop; it idles out like any pooled process.
+// AGY_ABORT_RESPAWN=off disables it.
+function respawnAfterAbort(sessionKey, dead) {
+    if (process.env.AGY_ABORT_RESPAWN === "off" || !dead.conversationId)
+        return;
+    const current = pool.get(sessionKey);
+    if (current && current !== dead && !current.exited)
+        return;
+    const proc = new AgyProcess({ ...dead.config, conversationId: dead.conversationId });
+    pool.set(sessionKey, proc);
+    trace(`respawn after abort key=${sessionKey} conv=${dead.conversationId}`);
+    proc.scheduleIdle();
+}
+
+export function poolSize() {
+    return pool.size;
 }
 
 export function disposeAllAgyProcesses() {
