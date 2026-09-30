@@ -1,0 +1,10 @@
+node_modules/
+bun.lock
+bun.lockb
+package-lock.json
+*.log
+*.tmp
+*.lock
+*.bak*
+.DS_Store
+.cache/

@@ -1,0 +1,52 @@
+{
+  "name": "opencode-agy-cli",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "license": "MIT",
+  "description": "High-performance OpenCode plugin & provider bridge connecting to the official Google Antigravity (agy) CLI with persistent daemon pooling, fast streaming, and zero token interception.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heyparves/opencode-agy-cli.git"
+  },
+  "homepage": "https://github.com/heyparves/opencode-agy-cli",
+  "bugs": {
+    "url": "https://github.com/heyparves/opencode-agy-cli/issues"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./provider": "./dist/provider.js",
+    "./plugin": "./dist/plugin.js"
+  },
+  "files": [
+    "dist",
+    "plugin.js",
+    "provider.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@ai-sdk/provider": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/provider": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^3.0.0",
+    "@opencode-ai/plugin": "1.18.18",
+    "@opencode-ai/sdk": "1.18.18",
+    "@types/bun": "latest",
+    "opencode-ai": "1.18.18",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.67",
+    "zod": "^3.25.0-beta.20250519T094321"
+  }
+}
