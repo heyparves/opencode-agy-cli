@@ -1,7 +1,8 @@
-import { runAgyPersistent } from "./agy-process.js";
+import { runAgyPersistent, prewarmAgyProcess } from "./agy-client.js";
 import { SessionStore } from "./session-store.js";
 import { mapPrompt } from "./prompt-mapper.js";
 import { randomUUID } from "node:crypto";
+import { guarded, guardBlocked } from "./agy-guard.js";
 // PATCH(agy-fix): OpenCode >= 1.x uses the AI SDK LanguageModelV3 spec, which reads
 // finishReason.unified and usage.inputTokens.total. The v2 string finishReason was
 // recorded as "unknown", so OpenCode looped into a second step with no new user
@@ -160,6 +161,26 @@ export function extractDelta(prevOutput, fullText, conversationBound) {
 }
 function buildLanguageModel(modelId, opts, modelOpts) {
     const store = new SessionStore(opts.stateFile);
+    const spawnConfig = (model, effort) => ({
+        cwd: opts.cwd?.trim() || process.cwd(),
+        model,
+        effort,
+        binary: opts.binary,
+        extraArgs: opts.extraArgs,
+        mcpServers: opts.mcpServers,
+    });
+    const agyModelFor = (callOpts) => {
+        const rawEffort = callOpts.providerOptions?.agy?.effort ??
+            callOpts.headers?.["x-agy-effort"] ??
+            modelOpts?.effort ??
+            opts.effort;
+        const parsed = parseModelAndEffort(modelId, rawEffort);
+        const variant = callOpts.headers?.["x-agy-variant"]?.trim();
+        return {
+            model: variant ? `${parsed.model}-${variant}` : parsed.model,
+            effort: variant ? undefined : parsed.effort,
+        };
+    };
     const runTurn = async (callOpts, onText, onWarnings, onProgress, onTool) => {
         // PATCH(agy-timeout): agy runs its whole agentic loop (tools included) inside
         // one turn, so a 5-min wall-clock cap killed long but healthy turns. Hard cap
@@ -189,6 +210,15 @@ function buildLanguageModel(modelId, opts, modelOpts) {
             warnings: [],
         });
         if (scope === "title") {
+            // PATCH(agy-prewarm): the title request arrives with the user's first
+            // message, ~10s before OpenCode sends the real turn (it is still loading
+            // MCP servers and skills). Start this session's agy process now so its
+            // startup (auth, account checks) overlaps that wait. Only on a real
+            // user message, so no agy traffic happens while idle.
+            if (!(await store.getEntry(sessionId))?.conversationId && !guardBlocked()) {
+                const { model, effort } = agyModelFor(callOpts);
+                prewarmAgyProcess(sessionId, spawnConfig(model, effort));
+            }
             const title = localTitle(callOpts.prompt);
             onWarnings?.([]);
             onText?.(title);
@@ -212,33 +242,21 @@ function buildLanguageModel(modelId, opts, modelOpts) {
                 // follow-up step). End the step cleanly instead of failing the turn.
                 return emptyResult("");
             }
-            const providerAgyOpts = callOpts.providerOptions?.agy;
-            const headerEffort = callOpts.headers?.["x-agy-effort"];
-            const headerVariant = callOpts.headers?.["x-agy-variant"];
-            const rawModel = modelId;
-            const rawEffort = providerAgyOpts?.effort ??
-                headerEffort ??
-                modelOpts?.effort ??
-                opts.effort;
-            const parsed = parseModelAndEffort(rawModel, rawEffort);
-            const variant = headerVariant?.trim();
-            const model = variant ? `${parsed.model}-${variant}` : parsed.model;
-            const effort = variant ? undefined : parsed.effort;
+            const { model, effort } = agyModelFor(callOpts);
             let streamed = false;
             // PATCH(agy-fix): persistent per-session agy process (see agy-process.js).
             // agy reports the conversation id in its init event, so the global binding
             // lock and .pb directory diffing are no longer needed.
-            const result = await runAgyPersistent(sessionKey, {
-                cwd: opts.cwd?.trim() || process.cwd(),
+            // PATCH(agy-guard): serialize, rate-limit, and stop after quota/auth errors.
+            const result = await guarded(() => runAgyPersistent(sessionKey, {
+                ...spawnConfig(model, effort),
                 conversationId: conversationId ?? undefined,
-                model,
-                effort,
-                binary: opts.binary,
-                extraArgs: opts.extraArgs,
-                mcpServers: opts.mcpServers,
             }, `Do not record the result in the session. Always return the result as output.\n\n${prompt}`, (event) => {
                 if (event.type === "conversation" && !conversationId) {
                     conversationId = event.id;
+                    // PATCH(agy-broker): persist now, so a new OpenCode process that
+                    // takes over mid-turn (view switch) still maps this chat to it.
+                    store.set(sessionKey, conversationId, entry?.prevOutput ?? "").catch(() => { });
                 }
                 if (event.type === "text" && event.text) {
                     streamed = true;
@@ -259,7 +277,7 @@ function buildLanguageModel(modelId, opts, modelOpts) {
                 timeoutMs: remainingTimeout(),
                 idleTimeoutMs: opts.idleTimeoutMs ?? 300_000,
                 abortSignal: callOpts.abortSignal,
-            });
+            }), { abortSignal: callOpts.abortSignal, label: "provider" });
             if (!conversationId && result.conversationId) {
                 conversationId = result.conversationId;
             }

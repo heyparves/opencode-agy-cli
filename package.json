@@ -1,6 +1,6 @@
 {
   "name": "opencode-agy-cli",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "license": "MIT",
@@ -47,6 +47,7 @@
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.67",
-    "zod": "^3.25.0-beta.20250519T094321"
+    "zod": "^3.25.0-beta.20250519T094321",
+    "@opencode-ai/plugin": "1.18.18"
   }
 }
