@@ -3,7 +3,7 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 const MODEL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const MODEL_CACHE_VERSION = 5;
+const MODEL_CACHE_VERSION = 7;
 function splitLastHyphen(id) {
     const i = id.lastIndexOf("-");
     if (i <= 0 || i === id.length - 1)
@@ -59,6 +59,13 @@ export function parseAgyModels(output) {
         else {
             models[row.id] = { name: row.label };
         }
+    }
+    // PATCH(agy-reasoning): OpenCode only shows the reasoning picker when
+    // `reasoning` is true. Only models agy lists with effort tiers get it; agy
+    // rejects `--effort` for the rest ("--effort is not supported for model").
+    for (const model of Object.values(models)) {
+        if (model.variants && Object.keys(model.variants).length > 0)
+            model.reasoning = true;
     }
     return models;
 }
