@@ -23,6 +23,11 @@ Most third-party integrations attempt to reverse-engineer Google Antigravity by 
 5. **Mirror HOME Optimization:** Symlinks runtime configurations while bypassing redundant MCP server indexing that can add 8–11s of latency per call.
 6. **OpenCode AI SDK v3 Compatibility:** Full support for OpenCode 1.x+ `LanguageModelV3` specifications, eliminating infinite retry loops from unmapped `finishReason` values.
 7. **Native Tool Mapping:** Transparently maps `agy` native tool calls (`run_command`, `view_file`, `replace_file_content`, `read_url_content`) to OpenCode UI tools (`bash`, `read`, `edit`, `webfetch`).
+8. **Usage Guard:** One agy turn at a time, a minimum gap between calls, an hourly cap, and an automatic pause after quota, 429, auth or Terms of Service errors, so nothing hammers Google's backend with retries.
+9. **Broker Daemon:** A small detached broker owns the agy processes, so hosts that restart `opencode serve` on every view switch keep the same warm agy and continuous conversation.
+10. **Warm Respawn After Stop:** agy has no cancel event, so Stop ends the process. The bridge immediately starts a replacement on the same `--conversation`, and your next message lands on a warm process instead of a cold "Resuming".
+11. **Reasoning Picker:** Gemini models that agy ships in low/medium/high tiers show OpenCode's variant picker.
+12. **`agy` Delegate Tool:** Any main model can hand scoped tasks to agy via the `agy` tool or `/agy` command, read-only by default.
 
 ---
 
@@ -150,6 +155,37 @@ If you prefer to lock specific models and reasoning variants instead of relying 
 |---|---|---|
 | `AGY_IDLE_MS` | `3600000` (60m) | Duration in milliseconds to keep idle `agy` background processes alive between turns before releasing memory. |
 | `AGY_DEBUG_RAW` | *unset* | Path to a file where raw incoming JSON events from `agy` stdout should be appended for troubleshooting. |
+| `AGY_GUARD` | *on* | Set to `off` to disable the usage guard (not recommended). |
+| `AGY_MIN_GAP_MS` | `3000` | Minimum time between agy turn starts. |
+| `AGY_MAX_PER_HOUR` | `60` | Maximum agy turns per hour across all OpenCode windows. |
+| `AGY_COOLDOWN_MS` | `1800000` (30m) | Pause after a quota, 429 or auth error. Terms of Service errors pause for 24h. Delete `~/.opencode-agy-plugin/guard.json` to reset. |
+| `AGY_BROKER` | *on* | Set to `off` to run agy inside each OpenCode process instead of the shared broker. |
+| `AGY_BROKER_IDLE_MS` | `1800000` (30m) | The broker exits after this long with no chats. |
+| `AGY_BUSY_WAIT_MS` | `300000` (5m) | How long a new message waits for a still-running turn in the same chat. |
+| `AGY_PREWARM` | *on* | Set to `off` to stop starting agy when the first message's title request arrives. |
+| `AGY_PREWARM_TTL_MS` | `300000` (5m) | Lifetime of a prewarmed agy that never receives a turn. |
+| `AGY_ABORT_RESPAWN` | *on* | Set to `off` to skip the warm respawn after Stop. |
+| `AGY_DELEGATE_IDLE_MS` | `900000` (15m) | Idle lifetime of the delegate tool's agy process. |
+
+### Provider Mode
+
+`provider.agy.options.mode` controls how agy appears in OpenCode:
+
+- `"both"` (default): agy models are selectable in `/model`, and the `agy` tool is available to other models.
+- `"delegate"`: agy models are hidden; only the `agy` tool and `/agy` command remain. This is the lowest-risk setup because agy only runs scoped tasks you hand it.
+
+### `agy` Delegate Tool
+
+| Argument | Description |
+|---|---|
+| `prompt` | The task for agy. |
+| `access` | `read` (default, no edits or shell), `write` (edits, sandboxed shell, asks for approval), `full` (asks for approval). |
+| `model` | agy model id from `agy models`, e.g. `gemini-3.8-flash-high`. Defaults to agy's own default. |
+| `effort` | `low`, `medium` (default), `high` or `max`. agy rejects `--effort` for Claude models. |
+| `dir` | Workspace directory. Defaults to the OpenCode project directory. |
+| `project` | agy project id or name, pins agy to one project. |
+| `fresh` | `true` starts a new agy conversation instead of continuing the session's one. |
+| `conversation` | Resume a specific agy conversation id. |
 
 ---
 
